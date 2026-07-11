@@ -19,7 +19,7 @@ type ExampleArgs struct {
 }
 
 type ExampleReply struct {
-	Y int
+	File string
 }
 
 // Add your RPC definitions here.

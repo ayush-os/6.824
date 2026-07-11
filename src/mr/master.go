@@ -8,8 +8,8 @@ import "net/http"
 
 
 type Master struct {
-	// Your definitions here.
-
+	files []string
+	nReduce int
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -20,7 +20,7 @@ type Master struct {
 // the RPC argument and reply types are defined in rpc.go.
 //
 func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
+	reply.File = m.files[0]
 	return nil
 }
 
@@ -62,8 +62,8 @@ func (m *Master) Done() bool {
 func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
 
-	// Your code here.
-
+	m.files = files
+	m.nReduce = nReduce
 
 	m.server()
 	return &m

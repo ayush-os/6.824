@@ -4,7 +4,8 @@ import "fmt"
 import "log"
 import "net/rpc"
 import "hash/fnv"
-
+import "io/ioutil"
+import "os"
 
 //
 // Map functions return a slice of KeyValue.
@@ -12,6 +13,11 @@ import "hash/fnv"
 type KeyValue struct {
 	Key   string
 	Value string
+}
+
+type WorkerStruct struct {
+    mapf    func(string, string) []KeyValue
+    reducef func(string, []string) string
 }
 
 //
@@ -32,9 +38,13 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
+	w := WorkerStruct{
+        mapf:    mapf,
+        reducef: reducef,
+    }
 
 	// uncomment to send the Example RPC to the master.
-	// CallExample()
+	w.CallExample()
 
 }
 
@@ -43,7 +53,7 @@ func Worker(mapf func(string, string) []KeyValue,
 //
 // the RPC argument and reply types are defined in rpc.go.
 //
-func CallExample() {
+func (w *WorkerStruct) CallExample() {
 
 	// declare an argument structure.
 	args := ExampleArgs{}
@@ -57,8 +67,22 @@ func CallExample() {
 	// send the RPC request, wait for the reply.
 	call("Master.Example", &args, &reply)
 
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
+	fmt.Printf("reply.File %s\n", reply.File)
+
+	file, err := os.Open(reply.File)
+    if err != nil {
+        log.Fatalf("cannot open %v", reply.File)
+    }
+    content, err := ioutil.ReadAll(file)
+    if err != nil {
+        log.Fatalf("cannot read %v", reply.File)
+    }
+    file.Close()
+
+	kva := w.mapf(reply.File, string(content))
+	_ = kva
+
+	fmt.Printf("successfully did the map kva\n")
 }
 
 //
