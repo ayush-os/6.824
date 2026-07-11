@@ -9,21 +9,49 @@ import "net/http"
 
 type Master struct {
 	files []string
+	idx int
+	
+	nMap int
+	nDoneMap int
+	
 	nReduce int
+	nInFlightReduces int
+	nDoneReduces int
 }
 
-// Your code here -- RPC handlers for the worker to call.
+func (m *Master) GetTask(args *TaskArgs, reply *TaskReply) error {
+	if args.FinishedMapTask {
+		m.nDoneMap++
+	} else if args.FinishedReduceTask {
+		m.nDoneReduces++
+		m.nInFlightReduces--
+	}
 
-//
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.File = m.files[0]
+	if m.nMap < m.nDoneMap {
+		if m.idx < len(m.files) {
+			reply.Action = Map
+			reply.File = m.files[m.idx]
+			reply.NReduce = m.nReduce
+			reply.TaskID = m.idx
+			m.idx++
+		} else {
+			reply.Action = Wait
+		}
+	} else {
+		if m.nReduce == m.nDoneReduces {
+			reply.Action = Shutdown
+		} else if m.nReduce == (m.nDoneReduces + m.nInFlightReduces) {
+			reply.Action = Wait
+		} else {
+			reply.Action = Reduce
+			reply.NReduce = m.nReduce
+			reply.TaskID = m.nInFlightReduces
+			m.nInFlightReduces++
+		}
+	}
+	
 	return nil
 }
-
 
 //
 // start a thread that listens for RPCs from worker.go
@@ -46,12 +74,7 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	ret := false
-
-	// Your code here.
-
-
-	return ret
+	return m.nReduce == m.nDoneReduces
 }
 
 //
@@ -63,6 +86,7 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
 
 	m.files = files
+	m.nMap = len(files)
 	m.nReduce = nReduce
 
 	m.server()

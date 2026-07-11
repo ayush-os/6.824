@@ -1,11 +1,17 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-import "io/ioutil"
-import "os"
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"sync/atomic"
+	"time"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -16,73 +22,170 @@ type KeyValue struct {
 }
 
 type WorkerStruct struct {
-    mapf    func(string, string) []KeyValue
-    reducef func(string, []string) string
+	id      int
+	mapf    func(string, string) []KeyValue
+	reducef func(string, []string) string
 }
 
-//
-// use ihash(key) % NReduce to choose the reduce
-// task number for each KeyValue emitted by Map.
-//
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
+var nextWorkerId atomic.Int64
+
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
-//
-// main/mrworker.go calls this function.
-//
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	// Your worker implementation here.
+	newID := nextWorkerId.Add(1)
+
 	w := WorkerStruct{
-        mapf:    mapf,
-        reducef: reducef,
-    }
+		id:      int(newID),
+		mapf:    mapf,
+		reducef: reducef,
+	}
 
-	// uncomment to send the Example RPC to the master.
-	w.CallExample()
-
+	w.DoTasks()
 }
 
-//
-// example function to show how to make an RPC call to the master.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func (w *WorkerStruct) CallExample() {
+func (w *WorkerStruct) DoTasks() {
+	args := TaskArgs{}
+	args.WorkerID = w.id
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+	reply := TaskReply{}
 
-	// fill in the argument(s).
-	args.X = 99
+	call("Master.GetTask", &args, &reply)
 
-	// declare a reply structure.
-	reply := ExampleReply{}
+	for {
+		if reply.Action == Map {
+			w.handleMapTask(&reply, &args)
+		} else if reply.Action == Reduce {
+			w.handleReduceTask(&reply, &args)
+		} else if reply.Action == Wait {
+			time.Sleep(time.Second)
+			args.FinishedMapTask = true
+			args.FinishedReduceTask = false
+		} else if reply.Action == Shutdown {
+			break
+		}
+	}
+}
 
-	// send the RPC request, wait for the reply.
-	call("Master.Example", &args, &reply)
+func (w *WorkerStruct) handleMapTask(reply *TaskReply, args *TaskArgs) {
+	tmpFiles := make([]*os.File, reply.NReduce)
+	encoders := make([]*json.Encoder, reply.NReduce)
 
-	fmt.Printf("reply.File %s\n", reply.File)
+	for i := 0; i < reply.NReduce; i++ {
+		tmpName := fmt.Sprintf("mr-tmp-%d-%d-*", reply.TaskID, i)
+		tmpFile, err := os.CreateTemp("", tmpName)
+		if err != nil {
+			log.Fatalf("cannot create temp file")
+		}
+		tmpFiles[i] = tmpFile
+		encoders[i] = json.NewEncoder(tmpFile)
+	}
 
 	file, err := os.Open(reply.File)
-    if err != nil {
-        log.Fatalf("cannot open %v", reply.File)
-    }
-    content, err := ioutil.ReadAll(file)
-    if err != nil {
-        log.Fatalf("cannot read %v", reply.File)
-    }
-    file.Close()
+	if err != nil {
+		log.Fatalf("cannot open %v", reply.File)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", reply.File)
+	}
+	file.Close()
 
 	kva := w.mapf(reply.File, string(content))
-	_ = kva
 
-	fmt.Printf("successfully did the map kva\n")
+	for _, kv := range kva {
+		bucket := ihash(kv.Key) % reply.NReduce
+
+		err := encoders[bucket].Encode(&kv)
+		if err != nil {
+			log.Fatalf("cannot encode json")
+		}
+	}
+
+	for i := 0; i < reply.NReduce; i++ {
+		tmpFiles[i].Close()
+		finalName := fmt.Sprintf("mr-%d-%d-*", reply.TaskID, i)
+		os.Rename(tmpFiles[i].Name(), finalName)
+	}
+
+	args.FinishedMapTask = true
+	args.FinishedReduceTask = false
+	call("Master.GetTask", args, reply)
+}
+
+func (w *WorkerStruct) handleReduceTask(reply *TaskReply, args *TaskArgs) {
+	file, err := os.Open(reply.File)
+	if err != nil {
+		log.Fatalf("cannot open %v", reply.File)
+	}
+	
+	var intermediate []KeyValue
+	dec := json.NewDecoder(file)
+	for {
+		var kv KeyValue
+		if err := dec.Decode(&kv); err != nil {
+			// err will be io.EOF when it hits the end of the file
+			break
+		}
+		intermediate = append(intermediate, kv)
+	}
+	file.Close()
+
+	sort.Sort(ByKey(intermediate))
+
+	tmpFile, err := os.CreateTemp("", "mr-tmp-*")
+	if err != nil {
+		log.Fatalf("cannot create temp file: %v", err)
+	}
+
+	tmpName := tmpFile.Name()
+
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+
+		// Collect all values for this specific key
+		var values []string
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+
+		// Call the user-defined Reduce function
+		output := w.reducef(intermediate[i].Key, values)
+
+		// Write the output in the required format
+		fmt.Fprintf(tmpFile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+
+	tmpFile.Close()
+
+	finalName := fmt.Sprintf("mr-out-%d", reply.TaskID)
+	err = os.Rename(tmpName, finalName)
+	if err != nil {
+		log.Fatalf("cannot rename temp file to final output: %v", err)
+	}
+
+	args.FinishedReduceTask = true
+	args.FinishedMapTask = false
+	call("Master.GetTask", args, reply)
 }
 
 //
