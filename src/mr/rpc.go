@@ -28,6 +28,7 @@ type TaskReply struct {
 
 	File string
 	NReduce int
+	NMap int
 	TaskID int
 }
 

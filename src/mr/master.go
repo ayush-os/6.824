@@ -11,10 +11,10 @@ type Master struct {
 	files []string
 	idx int
 	
-	nMap int
+	nTotMap int
 	nDoneMap int
 	
-	nReduce int
+	nTotReduce int
 	nInFlightReduces int
 	nDoneReduces int
 }
@@ -27,24 +27,25 @@ func (m *Master) GetTask(args *TaskArgs, reply *TaskReply) error {
 		m.nInFlightReduces--
 	}
 
-	if m.nMap < m.nDoneMap {
+	if m.nDoneMap < m.nTotMap {
 		if m.idx < len(m.files) {
 			reply.Action = Map
 			reply.File = m.files[m.idx]
-			reply.NReduce = m.nReduce
+			reply.NReduce = m.nTotReduce
 			reply.TaskID = m.idx
 			m.idx++
 		} else {
 			reply.Action = Wait
 		}
 	} else {
-		if m.nReduce == m.nDoneReduces {
+		if m.nTotReduce == m.nDoneReduces {
 			reply.Action = Shutdown
-		} else if m.nReduce == (m.nDoneReduces + m.nInFlightReduces) {
+		} else if m.nTotReduce == (m.nDoneReduces + m.nInFlightReduces) {
 			reply.Action = Wait
 		} else {
 			reply.Action = Reduce
-			reply.NReduce = m.nReduce
+			reply.NReduce = m.nTotReduce
+			reply.NMap = m.nTotMap
 			reply.TaskID = m.nInFlightReduces
 			m.nInFlightReduces++
 		}
@@ -74,7 +75,7 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	return m.nReduce == m.nDoneReduces
+	return m.nTotReduce == m.nDoneReduces
 }
 
 //
@@ -86,8 +87,8 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
 
 	m.files = files
-	m.nMap = len(files)
-	m.nReduce = nReduce
+	m.nTotMap = len(files)
+	m.nTotReduce = nReduce
 
 	m.server()
 	return &m

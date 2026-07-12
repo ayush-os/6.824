@@ -85,7 +85,7 @@ func (w *WorkerStruct) handleMapTask(reply *TaskReply, args *TaskArgs) {
 	encoders := make([]*json.Encoder, reply.NReduce)
 
 	for i := 0; i < reply.NReduce; i++ {
-		tmpName := fmt.Sprintf("mr-tmp-%d-%d-*", reply.TaskID, i)
+		tmpName := fmt.Sprintf("mr-tmp-%d-%d", reply.TaskID, i)
 		tmpFile, err := os.CreateTemp("", tmpName)
 		if err != nil {
 			log.Fatalf("cannot create temp file")
@@ -117,7 +117,7 @@ func (w *WorkerStruct) handleMapTask(reply *TaskReply, args *TaskArgs) {
 
 	for i := 0; i < reply.NReduce; i++ {
 		tmpFiles[i].Close()
-		finalName := fmt.Sprintf("mr-%d-%d-*", reply.TaskID, i)
+		finalName := fmt.Sprintf("mr-%d-%d", reply.TaskID, i)
 		os.Rename(tmpFiles[i].Name(), finalName)
 	}
 
@@ -127,22 +127,26 @@ func (w *WorkerStruct) handleMapTask(reply *TaskReply, args *TaskArgs) {
 }
 
 func (w *WorkerStruct) handleReduceTask(reply *TaskReply, args *TaskArgs) {
-	file, err := os.Open(reply.File)
-	if err != nil {
-		log.Fatalf("cannot open %v", reply.File)
-	}
-	
 	var intermediate []KeyValue
-	dec := json.NewDecoder(file)
-	for {
-		var kv KeyValue
-		if err := dec.Decode(&kv); err != nil {
-			// err will be io.EOF when it hits the end of the file
-			break
-		}
-		intermediate = append(intermediate, kv)
-	}
-	file.Close()
+
+    for m := 0; m < reply.NMap; m++ {
+        filename := fmt.Sprintf("mr-%d-%d", m, reply.TaskID)
+        
+        file, err := os.Open(filename)
+        if err != nil {
+            continue 
+        }
+
+        dec := json.NewDecoder(file)
+        for {
+            var kv KeyValue
+            if err := dec.Decode(&kv); err != nil {
+                break // End of file
+            }
+            intermediate = append(intermediate, kv)
+        }
+        file.Close()
+    }
 
 	sort.Sort(ByKey(intermediate))
 
