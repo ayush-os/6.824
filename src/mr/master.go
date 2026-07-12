@@ -51,7 +51,8 @@ func (m *Master) GetTask(args *TaskArgs, reply *TaskReply) error {
 
 	var wait bool = true
 	if m.nDoneMap < m.nTotMap {
-		for i, task := range m.mapTasks {
+		for i := range m.mapTasks {
+			task := &m.mapTasks[i]
 			if (task.State == IP && time.Since(task.StartTime) > 10*time.Second) || task.State == Todo {
 				task.State = IP
 				task.StartTime = time.Now()
@@ -63,6 +64,7 @@ func (m *Master) GetTask(args *TaskArgs, reply *TaskReply) error {
 				reply.TaskID = i
 
 				wait = false
+				break
 			}
 		}
 	} else {
@@ -70,7 +72,8 @@ func (m *Master) GetTask(args *TaskArgs, reply *TaskReply) error {
 			reply.Action = Shutdown
 			wait = false
 		} else {
-			for i, task := range m.reduceTasks {
+			for i := range m.reduceTasks {
+				task := &m.reduceTasks[i]
 				if (task.State == IP && time.Since(task.StartTime) > 10*time.Second) || task.State == Todo {
 					task.State = IP
 					task.StartTime = time.Now()
@@ -82,6 +85,7 @@ func (m *Master) GetTask(args *TaskArgs, reply *TaskReply) error {
 					reply.TaskID = i
 
 					wait = false
+					break
 				}
 			}
 		}
