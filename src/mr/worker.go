@@ -66,6 +66,8 @@ func (w *WorkerStruct) DoTasks() {
 			time.Sleep(time.Second)
 			args.FinishedMapTask = false
 			args.FinishedReduceTask = false
+
+			reply = TaskReply{}
 			ok = call("Master.GetTask", &args, &reply)
 		} else if reply.Action == Shutdown {
 			break
