@@ -6,7 +6,6 @@ import "os"
 import "net/rpc"
 import "net/http"
 
-
 type Master struct {
 	files []string
 	idx int
@@ -24,7 +23,6 @@ func (m *Master) GetTask(args *TaskArgs, reply *TaskReply) error {
 		m.nDoneMap++
 	} else if args.FinishedReduceTask {
 		m.nDoneReduces++
-		m.nInFlightReduces--
 	}
 
 	if m.nDoneMap < m.nTotMap {
@@ -40,7 +38,7 @@ func (m *Master) GetTask(args *TaskArgs, reply *TaskReply) error {
 	} else {
 		if m.nTotReduce == m.nDoneReduces {
 			reply.Action = Shutdown
-		} else if m.nTotReduce == (m.nDoneReduces + m.nInFlightReduces) {
+		} else if m.nTotReduce == m.nInFlightReduces {
 			reply.Action = Wait
 		} else {
 			reply.Action = Reduce

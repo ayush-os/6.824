@@ -72,8 +72,9 @@ func (w *WorkerStruct) DoTasks() {
 			w.handleReduceTask(&reply, &args)
 		} else if reply.Action == Wait {
 			time.Sleep(time.Second)
-			args.FinishedMapTask = true
+			args.FinishedMapTask = false
 			args.FinishedReduceTask = false
+			call("Master.GetTask", &args, &reply)
 		} else if reply.Action == Shutdown {
 			break
 		}
@@ -123,6 +124,8 @@ func (w *WorkerStruct) handleMapTask(reply *TaskReply, args *TaskArgs) {
 
 	args.FinishedMapTask = true
 	args.FinishedReduceTask = false
+
+	*reply = TaskReply{}
 	call("Master.GetTask", args, reply)
 }
 
@@ -189,6 +192,8 @@ func (w *WorkerStruct) handleReduceTask(reply *TaskReply, args *TaskArgs) {
 
 	args.FinishedReduceTask = true
 	args.FinishedMapTask = false
+
+	*reply = TaskReply{}
 	call("Master.GetTask", args, reply)
 }
 
