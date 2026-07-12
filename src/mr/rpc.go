@@ -4,8 +4,10 @@ package mr
 // RPC definitions.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+)
 
 type TaskAction int
 
@@ -19,17 +21,17 @@ const (
 type TaskArgs struct {
 	WorkerID int
 
-	FinishedMapTask bool
+	FinishedMapTask    bool
 	FinishedReduceTask bool
 }
 
 type TaskReply struct {
 	Action TaskAction
 
-	File string
+	File    string
 	NReduce int
-	NMap int
-	TaskID int
+	NMap    int
+	TaskID  int
 }
 
 // Cook up a unique-ish UNIX-domain socket name

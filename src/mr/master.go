@@ -1,24 +1,32 @@
 package mr
 
-import "log"
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
+import (
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+	"sync"
+)
 
 type Master struct {
+	mu sync.Mutex
+
 	files []string
-	idx int
-	
-	nTotMap int
+	idx   int
+
+	nTotMap  int
 	nDoneMap int
-	
-	nTotReduce int
+
+	nTotReduce       int
 	nInFlightReduces int
-	nDoneReduces int
+	nDoneReduces     int
 }
 
 func (m *Master) GetTask(args *TaskArgs, reply *TaskReply) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	if args.FinishedMapTask {
 		m.nDoneMap++
 	} else if args.FinishedReduceTask {
@@ -48,13 +56,10 @@ func (m *Master) GetTask(args *TaskArgs, reply *TaskReply) error {
 			m.nInFlightReduces++
 		}
 	}
-	
 	return nil
 }
 
-//
 // start a thread that listens for RPCs from worker.go
-//
 func (m *Master) server() {
 	rpc.Register(m)
 	rpc.HandleHTTP()
@@ -68,19 +73,17 @@ func (m *Master) server() {
 	go http.Serve(l, nil)
 }
 
-//
 // main/mrmaster.go calls Done() periodically to find out
 // if the entire job has finished.
-//
 func (m *Master) Done() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.nTotReduce == m.nDoneReduces
 }
 
-//
 // create a Master.
 // main/mrmaster.go calls this function.
 // nReduce is the number of reduce tasks to use.
-//
 func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
 

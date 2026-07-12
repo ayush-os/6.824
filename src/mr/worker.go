@@ -13,9 +13,7 @@ import (
 	"time"
 )
 
-//
 // Map functions return a slice of KeyValue.
-//
 type KeyValue struct {
 	Key   string
 	Value string
@@ -132,24 +130,24 @@ func (w *WorkerStruct) handleMapTask(reply *TaskReply, args *TaskArgs) {
 func (w *WorkerStruct) handleReduceTask(reply *TaskReply, args *TaskArgs) {
 	var intermediate []KeyValue
 
-    for m := 0; m < reply.NMap; m++ {
-        filename := fmt.Sprintf("mr-%d-%d", m, reply.TaskID)
-        
-        file, err := os.Open(filename)
-        if err != nil {
-            continue 
-        }
+	for m := 0; m < reply.NMap; m++ {
+		filename := fmt.Sprintf("mr-%d-%d", m, reply.TaskID)
 
-        dec := json.NewDecoder(file)
-        for {
-            var kv KeyValue
-            if err := dec.Decode(&kv); err != nil {
-                break // End of file
-            }
-            intermediate = append(intermediate, kv)
-        }
-        file.Close()
-    }
+		file, err := os.Open(filename)
+		if err != nil {
+			continue
+		}
+
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break // End of file
+			}
+			intermediate = append(intermediate, kv)
+		}
+		file.Close()
+	}
 
 	sort.Sort(ByKey(intermediate))
 
@@ -197,11 +195,9 @@ func (w *WorkerStruct) handleReduceTask(reply *TaskReply, args *TaskArgs) {
 	call("Master.GetTask", args, reply)
 }
 
-//
 // send an RPC request to the master, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
-//
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := masterSock()
