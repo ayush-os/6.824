@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
-
 	"log"
 	"net/rpc"
 	"os"
@@ -19,7 +18,7 @@ type KeyValue struct {
 	Value string
 }
 
-type WorkerStruct struct {
+type worker struct {
 	mapf    func(string, string) []KeyValue
 	reducef func(string, []string) string
 }
@@ -41,53 +40,47 @@ func ihash(key string) int {
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	w := WorkerStruct{
+	w := worker{
 		mapf:    mapf,
 		reducef: reducef,
 	}
 
-	w.DoTasks()
+	w.run()
 }
 
-func (w *WorkerStruct) DoTasks() {
-	args := TaskArgs{}
-	reply := TaskReply{}
-	ok := call("Master.GetTask", &args, &reply)
-	if !ok {
-		return
-	}
+func (w *worker) run() {
+	args := TaskArgs{FinishedTaskID: -1}
 
 	for {
-		if reply.Action == Map {
-			ok = w.handleMapTask(&reply, &args)
-		} else if reply.Action == Reduce {
-			ok = w.handleReduceTask(&reply, &args)
-		} else if reply.Action == Wait {
-			time.Sleep(time.Second)
-			args.FinishedMapTask = false
-			args.FinishedReduceTask = false
-
-			reply = TaskReply{}
-			ok = call("Master.GetTask", &args, &reply)
-		} else if reply.Action == Shutdown {
-			break
+		reply := TaskReply{}
+		if ok := call("Master.GetTask", &args, &reply); !ok {
+			return
 		}
 
-		if !ok {
+		switch reply.Action {
+		case Map:
+			w.doMap(&reply)
+			args = TaskArgs{FinishedAction: Map, FinishedTaskID: reply.TaskID}
+		case Reduce:
+			w.doReduce(&reply)
+			args = TaskArgs{FinishedAction: Reduce, FinishedTaskID: reply.TaskID}
+		case Wait:
+			time.Sleep(time.Second)
+			args = TaskArgs{FinishedTaskID: -1}
+		case Shutdown:
 			return
 		}
 	}
 }
 
-func (w *WorkerStruct) handleMapTask(reply *TaskReply, args *TaskArgs) bool {
+func (w *worker) doMap(reply *TaskReply) {
 	tmpFiles := make([]*os.File, reply.NReduce)
 	encoders := make([]*json.Encoder, reply.NReduce)
 
 	for i := 0; i < reply.NReduce; i++ {
-		tmpName := fmt.Sprintf("mr-tmp-%d-%d", reply.TaskID, i)
-		tmpFile, err := os.CreateTemp("", tmpName)
+		tmpFile, err := os.CreateTemp(".", fmt.Sprintf("mr-tmp-%d-%d-*", reply.TaskID, i))
 		if err != nil {
-			log.Fatalf("cannot create temp file")
+			log.Fatalf("cannot create temp file: %v", err)
 		}
 		tmpFiles[i] = tmpFile
 		encoders[i] = json.NewEncoder(tmpFile)
@@ -107,28 +100,21 @@ func (w *WorkerStruct) handleMapTask(reply *TaskReply, args *TaskArgs) bool {
 
 	for _, kv := range kva {
 		bucket := ihash(kv.Key) % reply.NReduce
-
-		err := encoders[bucket].Encode(&kv)
-		if err != nil {
-			log.Fatalf("cannot encode json")
+		if err := encoders[bucket].Encode(&kv); err != nil {
+			log.Fatalf("cannot encode json: %v", err)
 		}
 	}
 
 	for i := 0; i < reply.NReduce; i++ {
 		tmpFiles[i].Close()
 		finalName := fmt.Sprintf("mr-%d-%d", reply.TaskID, i)
-		os.Rename(tmpFiles[i].Name(), finalName)
+		if err := os.Rename(tmpFiles[i].Name(), finalName); err != nil {
+			log.Fatalf("cannot rename temp file to %v: %v", finalName, err)
+		}
 	}
-
-	args.FinishedMapTask = true
-	args.FinishedReduceTask = false
-	args.FinishedTaskID = reply.TaskID
-
-	*reply = TaskReply{}
-	return call("Master.GetTask", args, reply)
 }
 
-func (w *WorkerStruct) handleReduceTask(reply *TaskReply, args *TaskArgs) bool {
+func (w *worker) doReduce(reply *TaskReply) {
 	var intermediate []KeyValue
 
 	for m := 0; m < reply.NMap; m++ {
@@ -136,6 +122,7 @@ func (w *WorkerStruct) handleReduceTask(reply *TaskReply, args *TaskArgs) bool {
 
 		file, err := os.Open(filename)
 		if err != nil {
+			log.Printf("warning: could not open intermediate file %v: %v", filename, err)
 			continue
 		}
 
@@ -143,7 +130,7 @@ func (w *WorkerStruct) handleReduceTask(reply *TaskReply, args *TaskArgs) bool {
 		for {
 			var kv KeyValue
 			if err := dec.Decode(&kv); err != nil {
-				break // End of file
+				break // end of file
 			}
 			intermediate = append(intermediate, kv)
 		}
@@ -152,12 +139,10 @@ func (w *WorkerStruct) handleReduceTask(reply *TaskReply, args *TaskArgs) bool {
 
 	sort.Sort(ByKey(intermediate))
 
-	tmpFile, err := os.CreateTemp("", "mr-tmp-*")
+	tmpFile, err := os.CreateTemp(".", "mr-tmp-out-*")
 	if err != nil {
 		log.Fatalf("cannot create temp file: %v", err)
 	}
-
-	tmpName := tmpFile.Name()
 
 	i := 0
 	for i < len(intermediate) {
@@ -184,17 +169,9 @@ func (w *WorkerStruct) handleReduceTask(reply *TaskReply, args *TaskArgs) bool {
 	tmpFile.Close()
 
 	finalName := fmt.Sprintf("mr-out-%d", reply.TaskID)
-	err = os.Rename(tmpName, finalName)
-	if err != nil {
-		log.Fatalf("cannot rename temp file to final output: %v", err)
+	if err := os.Rename(tmpFile.Name(), finalName); err != nil {
+		log.Fatalf("cannot rename temp file to %v: %v", finalName, err)
 	}
-
-	args.FinishedReduceTask = true
-	args.FinishedMapTask = false
-	args.FinishedTaskID = reply.TaskID
-
-	*reply = TaskReply{}
-	return call("Master.GetTask", args, reply)
 }
 
 // send an RPC request to the master, wait for the response.

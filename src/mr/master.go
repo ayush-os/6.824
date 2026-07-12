@@ -14,9 +14,13 @@ type TaskState int
 
 const (
 	Todo TaskState = iota
-	IP
+	InProgress
 	Done
 )
+
+// taskTimeout is how long the master waits before assuming a worker
+// that was given a task has died, and reassigning that task.
+const taskTimeout = 10 * time.Second
 
 type Task struct {
 	File      string
@@ -41,66 +45,72 @@ func (m *Master) GetTask(args *TaskArgs, reply *TaskReply) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if args.FinishedMapTask && m.mapTasks[args.FinishedTaskID].State != Done {
-		m.mapTasks[args.FinishedTaskID].State = Done
-		m.nDoneMap++
-	} else if args.FinishedReduceTask && m.reduceTasks[args.FinishedTaskID].State != Done {
-		m.reduceTasks[args.FinishedTaskID].State = Done
-		m.nDoneReduce++
-	}
+	m.markFinished(args)
 
-	var wait bool = true
 	if m.nDoneMap < m.nTotMap {
-		for i := range m.mapTasks {
-			task := &m.mapTasks[i]
-			if (task.State == IP && time.Since(task.StartTime) > 10*time.Second) || task.State == Todo {
-				task.State = IP
-				task.StartTime = time.Now()
-
-				reply.Action = Map
-				reply.File = task.File
-				reply.NReduce = m.nTotReduce
-				reply.NMap = m.nTotMap
-				reply.TaskID = i
-
-				wait = false
-				break
-			}
+		if i, ok := assign(m.mapTasks); ok {
+			reply.Action = Map
+			reply.File = m.mapTasks[i].File
+			reply.NReduce = m.nTotReduce
+			reply.NMap = m.nTotMap
+			reply.TaskID = i
+			return nil
 		}
-	} else {
-		if m.nTotReduce == m.nDoneReduce {
-			reply.Action = Shutdown
-			wait = false
-		} else {
-			for i := range m.reduceTasks {
-				task := &m.reduceTasks[i]
-				if (task.State == IP && time.Since(task.StartTime) > 10*time.Second) || task.State == Todo {
-					task.State = IP
-					task.StartTime = time.Now()
-
-					reply.Action = Reduce
-					reply.File = ""
-					reply.NReduce = m.nTotReduce
-					reply.NMap = m.nTotMap
-					reply.TaskID = i
-
-					wait = false
-					break
-				}
-			}
-		}
-	}
-	if wait {
 		reply.Action = Wait
+		return nil
 	}
+
+	if m.nDoneReduce == m.nTotReduce {
+		reply.Action = Shutdown
+		return nil
+	}
+
+	if i, ok := assign(m.reduceTasks); ok {
+		reply.Action = Reduce
+		reply.NReduce = m.nTotReduce
+		reply.NMap = m.nTotMap
+		reply.TaskID = i
+		return nil
+	}
+
+	reply.Action = Wait
 	return nil
+}
+
+func (m *Master) markFinished(args *TaskArgs) {
+	if args.FinishedTaskID < 0 {
+		return
+	}
+	switch args.FinishedAction {
+	case Map:
+		if m.mapTasks[args.FinishedTaskID].State != Done {
+			m.mapTasks[args.FinishedTaskID].State = Done
+			m.nDoneMap++
+		}
+	case Reduce:
+		if m.reduceTasks[args.FinishedTaskID].State != Done {
+			m.reduceTasks[args.FinishedTaskID].State = Done
+			m.nDoneReduce++
+		}
+	}
+}
+
+func assign(tasks []Task) (int, bool) {
+	for i := range tasks {
+		t := &tasks[i]
+		if t.State == Todo || (t.State == InProgress && time.Since(t.StartTime) > taskTimeout) {
+			t.State = InProgress
+			t.StartTime = time.Now()
+			return i, true
+		}
+	}
+	return 0, false
 }
 
 // start a thread that listens for RPCs from worker.go
 func (m *Master) server() {
 	rpc.Register(m)
 	rpc.HandleHTTP()
-	//l, e := net.Listen("tcp", ":1234")
 	sockname := masterSock()
 	os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)
