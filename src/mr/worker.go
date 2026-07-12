@@ -10,7 +10,6 @@ import (
 	"net/rpc"
 	"os"
 	"sort"
-	"sync/atomic"
 	"time"
 )
 
@@ -21,7 +20,6 @@ type KeyValue struct {
 }
 
 type WorkerStruct struct {
-	id      int
 	mapf    func(string, string) []KeyValue
 	reducef func(string, []string) string
 }
@@ -34,8 +32,6 @@ func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
-var nextWorkerId atomic.Int64
-
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
@@ -45,10 +41,7 @@ func ihash(key string) int {
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	newID := nextWorkerId.Add(1)
-
 	w := WorkerStruct{
-		id:      int(newID),
 		mapf:    mapf,
 		reducef: reducef,
 	}
@@ -58,29 +51,33 @@ func Worker(mapf func(string, string) []KeyValue,
 
 func (w *WorkerStruct) DoTasks() {
 	args := TaskArgs{}
-	args.WorkerID = w.id
-
 	reply := TaskReply{}
-
-	call("Master.GetTask", &args, &reply)
+	ok := call("Master.GetTask", &args, &reply)
+	if !ok {
+		return
+	}
 
 	for {
 		if reply.Action == Map {
-			w.handleMapTask(&reply, &args)
+			ok = w.handleMapTask(&reply, &args)
 		} else if reply.Action == Reduce {
-			w.handleReduceTask(&reply, &args)
+			ok = w.handleReduceTask(&reply, &args)
 		} else if reply.Action == Wait {
 			time.Sleep(time.Second)
 			args.FinishedMapTask = false
 			args.FinishedReduceTask = false
-			call("Master.GetTask", &args, &reply)
+			ok = call("Master.GetTask", &args, &reply)
 		} else if reply.Action == Shutdown {
 			break
+		}
+
+		if !ok {
+			return
 		}
 	}
 }
 
-func (w *WorkerStruct) handleMapTask(reply *TaskReply, args *TaskArgs) {
+func (w *WorkerStruct) handleMapTask(reply *TaskReply, args *TaskArgs) bool {
 	tmpFiles := make([]*os.File, reply.NReduce)
 	encoders := make([]*json.Encoder, reply.NReduce)
 
@@ -123,12 +120,13 @@ func (w *WorkerStruct) handleMapTask(reply *TaskReply, args *TaskArgs) {
 
 	args.FinishedMapTask = true
 	args.FinishedReduceTask = false
+	args.FinishedTaskID = reply.TaskID
 
 	*reply = TaskReply{}
-	call("Master.GetTask", args, reply)
+	return call("Master.GetTask", args, reply)
 }
 
-func (w *WorkerStruct) handleReduceTask(reply *TaskReply, args *TaskArgs) {
+func (w *WorkerStruct) handleReduceTask(reply *TaskReply, args *TaskArgs) bool {
 	var intermediate []KeyValue
 
 	for m := 0; m < reply.NMap; m++ {
@@ -191,20 +189,20 @@ func (w *WorkerStruct) handleReduceTask(reply *TaskReply, args *TaskArgs) {
 
 	args.FinishedReduceTask = true
 	args.FinishedMapTask = false
+	args.FinishedTaskID = reply.TaskID
 
 	*reply = TaskReply{}
-	call("Master.GetTask", args, reply)
+	return call("Master.GetTask", args, reply)
 }
 
 // send an RPC request to the master, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
 func call(rpcname string, args interface{}, reply interface{}) bool {
-	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := masterSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		return false
 	}
 	defer c.Close()
 

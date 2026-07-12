@@ -19,10 +19,9 @@ const (
 )
 
 type TaskArgs struct {
-	WorkerID int
-
 	FinishedMapTask    bool
 	FinishedReduceTask bool
+	FinishedTaskID     int
 }
 
 type TaskReply struct {

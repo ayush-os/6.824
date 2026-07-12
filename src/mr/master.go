@@ -7,54 +7,87 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
+	"time"
 )
+
+type TaskState int
+
+const (
+	Todo TaskState = iota
+	IP
+	Done
+)
+
+type Task struct {
+	File      string
+	State     TaskState
+	StartTime time.Time
+}
 
 type Master struct {
 	mu sync.Mutex
 
-	files []string
-	idx   int
+	mapTasks    []Task
+	reduceTasks []Task
 
 	nTotMap  int
 	nDoneMap int
 
-	nTotReduce       int
-	nInFlightReduces int
-	nDoneReduces     int
+	nTotReduce  int
+	nDoneReduce int
 }
 
 func (m *Master) GetTask(args *TaskArgs, reply *TaskReply) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if args.FinishedMapTask {
+	if args.FinishedMapTask && m.mapTasks[args.FinishedTaskID].State != Done {
+		m.mapTasks[args.FinishedTaskID].State = Done
 		m.nDoneMap++
-	} else if args.FinishedReduceTask {
-		m.nDoneReduces++
+	} else if args.FinishedReduceTask && m.reduceTasks[args.FinishedTaskID].State != Done {
+		m.reduceTasks[args.FinishedTaskID].State = Done
+		m.nDoneReduce++
 	}
 
+	var wait bool = true
 	if m.nDoneMap < m.nTotMap {
-		if m.idx < len(m.files) {
-			reply.Action = Map
-			reply.File = m.files[m.idx]
-			reply.NReduce = m.nTotReduce
-			reply.TaskID = m.idx
-			m.idx++
-		} else {
-			reply.Action = Wait
+		for i, task := range m.mapTasks {
+			if (task.State == IP && time.Since(task.StartTime) > 10*time.Second) || task.State == Todo {
+				task.State = IP
+				task.StartTime = time.Now()
+
+				reply.Action = Map
+				reply.File = task.File
+				reply.NReduce = m.nTotReduce
+				reply.NMap = m.nTotMap
+				reply.TaskID = i
+
+				wait = false
+			}
 		}
 	} else {
-		if m.nTotReduce == m.nDoneReduces {
+		if m.nTotReduce == m.nDoneReduce {
 			reply.Action = Shutdown
-		} else if m.nTotReduce == m.nInFlightReduces {
-			reply.Action = Wait
+			wait = false
 		} else {
-			reply.Action = Reduce
-			reply.NReduce = m.nTotReduce
-			reply.NMap = m.nTotMap
-			reply.TaskID = m.nInFlightReduces
-			m.nInFlightReduces++
+			for i, task := range m.reduceTasks {
+				if (task.State == IP && time.Since(task.StartTime) > 10*time.Second) || task.State == Todo {
+					task.State = IP
+					task.StartTime = time.Now()
+
+					reply.Action = Reduce
+					reply.File = ""
+					reply.NReduce = m.nTotReduce
+					reply.NMap = m.nTotMap
+					reply.TaskID = i
+
+					wait = false
+				}
+			}
 		}
+	}
+	if wait {
+		reply.Action = Wait
 	}
 	return nil
 }
@@ -78,7 +111,7 @@ func (m *Master) server() {
 func (m *Master) Done() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.nTotReduce == m.nDoneReduces
+	return m.nTotReduce == m.nDoneReduce
 }
 
 // create a Master.
@@ -87,9 +120,19 @@ func (m *Master) Done() bool {
 func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
 
-	m.files = files
-	m.nTotMap = len(files)
-	m.nTotReduce = nReduce
+	for _, file := range files {
+		m.mapTasks = append(m.mapTasks, Task{
+			File:  file,
+			State: Todo,
+		})
+	}
+	for range nReduce {
+		m.reduceTasks = append(m.reduceTasks, Task{
+			State: Todo,
+		})
+	}
+	m.nTotMap = len(m.mapTasks)
+	m.nTotReduce = len(m.reduceTasks)
 
 	m.server()
 	return &m
