@@ -4,7 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
-	"io/ioutil"
+	"io"
+
 	"log"
 	"net/rpc"
 	"os"
@@ -97,7 +98,7 @@ func (w *WorkerStruct) handleMapTask(reply *TaskReply, args *TaskArgs) {
 	if err != nil {
 		log.Fatalf("cannot open %v", reply.File)
 	}
-	content, err := ioutil.ReadAll(file)
+	content, err := io.ReadAll(file)
 	if err != nil {
 		log.Fatalf("cannot read %v", reply.File)
 	}
