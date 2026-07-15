@@ -56,6 +56,34 @@ const (
 	Leader
 )
 
+func (r NodeRole) String() string {
+	switch r {
+	case Follower:
+		return "Follower"
+	case Candidate:
+		return "Candidate"
+	case Leader:
+		return "Leader"
+	default:
+		return "Unknown"
+	}
+}
+
+const (
+	// heartbeatInterval is how often the leader sends AppendEntries.
+	// Must stay <= 100ms to respect the tester's 10/sec cap; a small
+	// margin below the cap absorbs scheduling jitter.
+	heartbeatInterval = 110 * time.Millisecond
+
+	// electionTimeoutMin/Max bound the randomized election timeout.
+	// Must be comfortably larger than heartbeatInterval (since the
+	// tester caps heartbeats at 10/sec, the paper's 150-300ms range
+	// is too tight) while still allowing a new leader to be elected
+	// well within the tester's 5-second window.
+	electionTimeoutMin = 300 * time.Millisecond
+	electionTimeoutMax = 600 * time.Millisecond
+)
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -86,6 +114,16 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.currentTerm, rf.currentRole == Leader
+}
+
+// lastLogInfo returns the index and term of the last entry in rf.log.
+// Caller must hold rf.mu.
+func (rf *Raft) lastLogInfo() (index, term int) {
+	index = len(rf.log) - 1
+	if index >= 0 {
+		term = rf.log[index].Term
+	}
+	return
 }
 
 // save Raft's persistent state to stable storage,
@@ -135,6 +173,10 @@ type RequestVoteReply struct {
 }
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	if rf.killed() {
+		return
+	}
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -146,11 +188,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.Term = rf.currentTerm
 
-	myLastLogIdx := len(rf.log) - 1
-	myLastLogTerm := 0
-	if myLastLogIdx >= 0 {
-		myLastLogTerm = rf.log[myLastLogIdx].Term
-	}
+	myLastLogIdx, myLastLogTerm := rf.lastLogInfo()
 
 	logUpToDate := args.LastLogTerm > myLastLogTerm || (args.LastLogTerm == myLastLogTerm && args.LastLogIdx >= myLastLogIdx)
 
@@ -177,6 +215,10 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if rf.killed() {
+		return
+	}
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -205,7 +247,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Success = true
 
-	// TODO steps 3-5 of Receiverimplementation page 2
+	// TODO steps 3-5 of Receiver implementation page 2
 	rf.lastHeartbeat = time.Now()
 }
 
@@ -307,11 +349,7 @@ func (rf *Raft) heartbeatLoop() {
 			return
 		}
 
-		prevLogIdx := len(rf.log) - 1
-		prevLogTerm := 0
-		if prevLogIdx >= 0 {
-			prevLogTerm = rf.log[prevLogIdx].Term
-		}
+		prevLogIdx, prevLogTerm := rf.lastLogInfo()
 		args := AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderID:     rf.me,
@@ -341,13 +379,14 @@ func (rf *Raft) heartbeatLoop() {
 					rf.currentTerm = reply.Term
 					rf.currentRole = Follower
 					rf.votedFor = -1
+					rf.lastHeartbeat = time.Now()
 					return
 				}
 
 				// TODO 2B do something here
 			}(i)
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(heartbeatInterval)
 	}
 }
 
@@ -360,11 +399,7 @@ func (rf *Raft) convertToCandidate() {
 	rf.votedFor = rf.me
 	rf.lastHeartbeat = time.Now()
 
-	lastLogIndex := len(rf.log) - 1
-	lastLogTerm := 0
-	if lastLogIndex >= 0 {
-		lastLogTerm = rf.log[lastLogIndex].Term
-	}
+	lastLogIndex, lastLogTerm := rf.lastLogInfo()
 
 	args := RequestVoteArgs{
 		Term:        rf.currentTerm,
@@ -373,13 +408,12 @@ func (rf *Raft) convertToCandidate() {
 		LastLogTerm: lastLogTerm,
 	}
 
-	votes := 1
+	votes := 1 // protected by rf.mu; only ever touched while holding it
 	termAtStart := rf.currentTerm
 	rf.mu.Unlock()
 
 	quorumTarget := (len(rf.peers) / 2) + 1
 
-	// fmt.Printf("num peers: %d\n", len(rf.peers))
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
@@ -388,7 +422,6 @@ func (rf *Raft) convertToCandidate() {
 		go func(peer int) {
 			var reply RequestVoteReply
 			ok := rf.sendRequestVote(peer, &args, &reply)
-
 			if !ok {
 				return
 			}
@@ -408,28 +441,27 @@ func (rf *Raft) convertToCandidate() {
 				return
 			}
 
-			// fmt.Printf("IN CONVERTTOCANDIDATE for i = %d reply.VoteGranted: %v\n", i, reply.VoteGranted)
+			becameLeader := false
 			if reply.VoteGranted {
-				// fmt.Printf("IN CONVERTOCANDIATE WHY AM I NOT COMING INSIDE HERE\n")
 				votes++
 				if votes == quorumTarget {
-					rf.mu.Unlock()
-					rf.convertToLeader()
-					return
+					becameLeader = true
 				}
 			}
 
 			rf.mu.Unlock()
+
+			if becameLeader {
+				rf.convertToLeader()
+			}
 		}(i)
 	}
-
-	// fmt.Printf("IN CONVERTTOCANDIDATE hows it goin candidate target: %d votes %d\n", quorumTarget, votes)
-
 }
 
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
-		timeout := time.Duration(300+rand.Intn(300)) * time.Millisecond // 300–600ms
+	for !rf.killed() {
+		span := int64(electionTimeoutMax - electionTimeoutMin)
+		timeout := electionTimeoutMin + time.Duration(rand.Int63n(span))
 
 		time.Sleep(timeout)
 
