@@ -42,6 +42,18 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+type LogEntry struct {
+	Term int
+}
+
+type NodeRole int
+
+const (
+	Follower NodeRole = iota
+	Candidate
+	Leader
+)
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -50,20 +62,25 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
+	// persistant state
+	currentRole NodeRole
+	currentTerm int
+	votedFor    int
+	log         []LogEntry
 
+	// volatile state
+	commitIndex int
+	lastApplied int
+
+	// volatile state on leader
+	nextIndex  []int
+	matchIndex []int
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here (2A).
-	return term, isleader
+	return rf.currentTerm, rf.currentRole == Leader
 }
 
 // save Raft's persistent state to stable storage,
@@ -100,21 +117,51 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
 type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
+	Term        int
+	CandidateID int
+	LastLogIdx  int
+	LastLogTerm int
 }
 
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
 type RequestVoteReply struct {
-	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
-// example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
+	reply.Term = rf.currentTerm
+
+	myLastLogTerm := rf.log[len(rf.log)-1].Term
+	myLastLogIdx := len(rf.log) - 1
+
+	logUpToDate := args.LastLogTerm > myLastLogTerm || (args.LastLogTerm == myLastLogTerm && args.LastLogIdx >= myLastLogIdx)
+
+	reply.VoteGranted = (args.Term >= rf.currentTerm) && (rf.votedFor == -1 || rf.votedFor == args.CandidateID) && logUpToDate
+
+	if reply.VoteGranted {
+		rf.votedFor = args.CandidateID
+	}
+}
+
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderID     int
+	PrevLogIdx   int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	reply.Success = (args.Term >= rf.currentTerm) && (len(rf.log) > args.PrevLogIdx && rf.log[args.PrevLogIdx].Term == args.PrevLogTerm)
+
+	// TODO steps 3-5 of Receiverimplementation page 2
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -206,7 +253,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
-	// Your initialization code here (2A, 2B, 2C).
+	rf.votedFor = -1
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
