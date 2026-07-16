@@ -45,7 +45,8 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
-	Term int
+	Term    int
+	Command interface{}
 }
 
 type NodeRole int
@@ -240,14 +241,39 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	if args.PrevLogIdx >= 0 && rf.log[args.PrevLogIdx].Term != args.PrevLogTerm {
+	if rf.log[args.PrevLogIdx].Term != args.PrevLogTerm {
 		reply.Success = false
 		return
 	}
 
 	reply.Success = true
 
-	// TODO steps 3-5 of Receiver implementation page 2
+	for i, entry := range args.Entries {
+		currentIdx := args.PrevLogIdx + 1 + i
+
+		if currentIdx < len(rf.log) {
+			if rf.log[currentIdx].Term != entry.Term {
+				rf.log = rf.log[:currentIdx]
+				rf.log = append(rf.log, args.Entries[i:]...)
+				break
+			}
+		} else {
+			rf.log = append(rf.log, args.Entries[i:]...)
+			break
+		}
+	}
+
+	if args.LeaderCommit > rf.commitIndex {
+		indexOfLastNewEntry := args.PrevLogIdx + len(args.Entries)
+
+		if args.LeaderCommit < indexOfLastNewEntry {
+			rf.commitIndex = args.LeaderCommit
+		} else {
+			rf.commitIndex = indexOfLastNewEntry
+		}
+
+		// TODO applyCh signal here
+	}
 	rf.lastHeartbeat = time.Now()
 }
 
@@ -288,6 +314,74 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+// assumes caller already holds rf.mu
+func (rf *Raft) startAgreement() {
+	for i := range rf.peers {
+		if (i == rf.me) || ((len(rf.log) - 1) < rf.nextIndex[i]) {
+			continue
+		}
+
+		args := AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderID:     rf.me,
+			PrevLogIdx:   rf.nextIndex[i] - 1,
+			PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
+			Entries:      append([]LogEntry{}, rf.log[rf.nextIndex[i]:]...),
+			LeaderCommit: rf.commitIndex,
+		}
+
+		go func(peer int, args AppendEntriesArgs) {
+			for {
+				var reply AppendEntriesReply
+				ok := rf.sendAppendEntries(peer, &args, &reply)
+				if !ok {
+					return
+				}
+
+				rf.mu.Lock()
+
+				if rf.currentTerm != args.Term || rf.currentRole != Leader {
+					rf.mu.Unlock()
+					return
+				}
+
+				if reply.Term > rf.currentTerm {
+					rf.currentTerm = reply.Term
+					rf.currentRole = Follower
+					rf.votedFor = -1
+					rf.lastHeartbeat = time.Now()
+					rf.mu.Unlock()
+					return
+				}
+
+				if reply.Success {
+					rf.matchIndex[peer] = args.PrevLogIdx + len(args.Entries)
+					rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+
+					rf.mu.Unlock()
+					return
+				}
+
+				rf.nextIndex[peer]--
+				if rf.nextIndex[peer] < 1 {
+					rf.nextIndex[peer] = 1
+				}
+
+				args = AppendEntriesArgs{
+					Term:         rf.currentTerm,
+					LeaderID:     rf.me,
+					PrevLogIdx:   rf.nextIndex[peer] - 1,
+					PrevLogTerm:  rf.log[rf.nextIndex[peer]-1].Term,
+					Entries:      append([]LogEntry{}, rf.log[rf.nextIndex[peer]:]...),
+					LeaderCommit: rf.commitIndex,
+				}
+
+				rf.mu.Unlock()
+			}
+		}(i, args)
+	}
+}
+
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -301,13 +395,23 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	if rf.killed() {
+		return -1, -1, false
+	}
 
-	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	return index, term, isLeader
+	if rf.currentRole != Leader {
+		return -1, rf.currentTerm, false
+	}
+
+	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
+	index := len(rf.log) - 1
+
+	rf.startAgreement() // caller must hold rf.mu
+
+	return index, rf.currentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -336,6 +440,10 @@ func (rf *Raft) convertToLeader() {
 		return
 	}
 	rf.currentRole = Leader
+	for i := range rf.peers {
+		rf.nextIndex[i] = len(rf.log)
+		rf.matchIndex[i] = 0
+	}
 	rf.mu.Unlock()
 
 	go rf.heartbeatLoop()
@@ -494,6 +602,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	rf.votedFor = -1
+
+	rf.log = []LogEntry{{Term: 0}}
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
