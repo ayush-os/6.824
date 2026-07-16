@@ -19,6 +19,7 @@ package raft
 
 import (
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -74,7 +75,7 @@ const (
 	// heartbeatInterval is how often the leader sends AppendEntries.
 	// Must stay <= 100ms to respect the tester's 10/sec cap; a small
 	// margin below the cap absorbs scheduling jitter.
-	heartbeatInterval = 110 * time.Millisecond
+	heartbeatInterval = 100 * time.Millisecond
 
 	// electionTimeoutMin/Max bound the randomized election timeout.
 	// Must be comfortably larger than heartbeatInterval (since the
@@ -92,6 +93,9 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+
+	applyCh   chan ApplyMsg
+	applyCond *sync.Cond
 
 	// persistant state
 	currentRole NodeRole
@@ -225,7 +229,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Term = rf.currentTerm
 
-	if args.Term > rf.currentTerm || rf.currentRole == Candidate {
+	if args.Term > rf.currentTerm || (args.Term == rf.currentTerm && rf.currentRole == Candidate) {
 		rf.currentTerm = args.Term
 		rf.currentRole = Follower
 		rf.votedFor = -1
@@ -235,6 +239,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
+
+	rf.lastHeartbeat = time.Now()
 
 	if len(rf.log) <= args.PrevLogIdx {
 		reply.Success = false
@@ -271,10 +277,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		} else {
 			rf.commitIndex = indexOfLastNewEntry
 		}
-
-		// TODO applyCh signal here
+		rf.applyCond.Signal()
 	}
-	rf.lastHeartbeat = time.Now()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -317,83 +321,85 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // assumes caller already holds rf.mu
 func (rf *Raft) startAgreement() {
 	for i := range rf.peers {
-		if (i == rf.me) || ((len(rf.log) - 1) < rf.nextIndex[i]) {
+		if i == rf.me {
 			continue
+		}
+
+		prevLogIdx := rf.nextIndex[i] - 1
+		prevLogTerm := rf.log[prevLogIdx].Term
+
+		var entries []LogEntry
+		if len(rf.log) > rf.nextIndex[i] {
+			entries = append([]LogEntry{}, rf.log[rf.nextIndex[i]:]...)
 		}
 
 		args := AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderID:     rf.me,
-			PrevLogIdx:   rf.nextIndex[i] - 1,
-			PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
-			Entries:      append([]LogEntry{}, rf.log[rf.nextIndex[i]:]...),
+			PrevLogIdx:   prevLogIdx,
+			PrevLogTerm:  prevLogTerm,
+			Entries:      entries,
 			LeaderCommit: rf.commitIndex,
 		}
 
 		go func(peer int, args AppendEntriesArgs) {
-			for {
-				var reply AppendEntriesReply
-				ok := rf.sendAppendEntries(peer, &args, &reply)
-				if !ok {
-					return
+			var reply AppendEntriesReply
+			ok := rf.sendAppendEntries(peer, &args, &reply)
+			if !ok {
+				return
+			}
+
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			if rf.currentTerm != args.Term || rf.currentRole != Leader {
+				return
+			}
+
+			if reply.Term > rf.currentTerm {
+				rf.currentTerm = reply.Term
+				rf.currentRole = Follower
+				rf.votedFor = -1
+				rf.lastHeartbeat = time.Now()
+				return
+			}
+
+			if reply.Success {
+				newMatch := args.PrevLogIdx + len(args.Entries)
+				if newMatch > rf.matchIndex[peer] {
+					rf.matchIndex[peer] = newMatch
+					rf.nextIndex[peer] = newMatch + 1
+					rf.updateLeaderCommitIndex()
 				}
-
-				rf.mu.Lock()
-
-				if rf.currentTerm != args.Term || rf.currentRole != Leader {
-					rf.mu.Unlock()
-					return
-				}
-
-				if reply.Term > rf.currentTerm {
-					rf.currentTerm = reply.Term
-					rf.currentRole = Follower
-					rf.votedFor = -1
-					rf.lastHeartbeat = time.Now()
-					rf.mu.Unlock()
-					return
-				}
-
-				if reply.Success {
-					rf.matchIndex[peer] = args.PrevLogIdx + len(args.Entries)
-					rf.nextIndex[peer] = rf.matchIndex[peer] + 1
-
-					rf.mu.Unlock()
-					return
-				}
-
+			} else {
+				// Step back nextIndex on conflict and wait for the next replication run
 				rf.nextIndex[peer]--
 				if rf.nextIndex[peer] < 1 {
 					rf.nextIndex[peer] = 1
 				}
-
-				args = AppendEntriesArgs{
-					Term:         rf.currentTerm,
-					LeaderID:     rf.me,
-					PrevLogIdx:   rf.nextIndex[peer] - 1,
-					PrevLogTerm:  rf.log[rf.nextIndex[peer]-1].Term,
-					Entries:      append([]LogEntry{}, rf.log[rf.nextIndex[peer]:]...),
-					LeaderCommit: rf.commitIndex,
-				}
-
-				rf.mu.Unlock()
 			}
 		}(i, args)
 	}
 }
 
-// the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log. if this
-// server isn't the leader, returns false. otherwise start the
-// agreement and return immediately. there is no guarantee that this
-// command will ever be committed to the Raft log, since the leader
-// may fail or lose an election. even if the Raft instance has been killed,
-// this function should return gracefully.
-//
-// the first return value is the index that the command will appear at
-// if it's ever committed. the second return value is the current
-// term. the third return value is true if this server believes it is
-// the leader.
+func (rf *Raft) updateLeaderCommitIndex() {
+	if rf.currentRole != Leader {
+		return
+	}
+
+	matches := make([]int, len(rf.peers))
+	copy(matches, rf.matchIndex)
+	matches[rf.me] = len(rf.log) - 1
+
+	sort.Ints(matches)
+	majorityN := matches[len(rf.peers)/2]
+
+	if majorityN > rf.commitIndex && rf.log[majorityN].Term == rf.currentTerm {
+		rf.commitIndex = majorityN
+		rf.applyCond.Signal()
+	}
+}
+
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.killed() {
 		return -1, -1, false
@@ -425,7 +431,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
+	rf.mu.Lock()
+	rf.applyCond.Broadcast()
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) killed() bool {
@@ -456,44 +464,9 @@ func (rf *Raft) heartbeatLoop() {
 			rf.mu.Unlock()
 			return
 		}
-
-		prevLogIdx, prevLogTerm := rf.lastLogInfo()
-		args := AppendEntriesArgs{
-			Term:         rf.currentTerm,
-			LeaderID:     rf.me,
-			PrevLogIdx:   prevLogIdx,
-			PrevLogTerm:  prevLogTerm,
-			Entries:      nil, // tmp for 2A
-			LeaderCommit: rf.commitIndex,
-		}
+		rf.startAgreement()
 		rf.mu.Unlock()
 
-		for i := range rf.peers {
-			if i == rf.me {
-				continue
-			}
-
-			go func(peer int) {
-				var reply AppendEntriesReply
-				ok := rf.sendAppendEntries(peer, &args, &reply)
-				if !ok {
-					return
-				}
-
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
-
-				if reply.Term > rf.currentTerm {
-					rf.currentTerm = reply.Term
-					rf.currentRole = Follower
-					rf.votedFor = -1
-					rf.lastHeartbeat = time.Now()
-					return
-				}
-
-				// TODO 2B do something here
-			}(i)
-		}
 		time.Sleep(heartbeatInterval)
 	}
 }
@@ -584,15 +557,40 @@ func (rf *Raft) ticker() {
 	}
 }
 
-// the service or tester wants to create a Raft server. the ports
-// of all the Raft servers (including this one) are in peers[]. this
-// server's port is peers[me]. all the servers' peers[] arrays
-// have the same order. persister is a place for this server to
-// save its persistent state, and also initially holds the most
-// recent saved state, if any. applyCh is a channel on which the
-// tester or service expects Raft to send ApplyMsg messages.
-// Make() must return quickly, so it should start goroutines
-// for any long-running work.
+func (rf *Raft) applier() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		for rf.commitIndex <= rf.lastApplied {
+			rf.applyCond.Wait()
+			if rf.killed() {
+				rf.mu.Unlock()
+				return
+			}
+		}
+
+		startIdx := rf.lastApplied + 1
+		endIdx := rf.commitIndex
+
+		entries := make([]LogEntry, endIdx-startIdx+1)
+		copy(entries, rf.log[startIdx:endIdx+1])
+		rf.mu.Unlock()
+
+		for i, entry := range entries {
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      entry.Command,
+				CommandIndex: startIdx + i,
+			}
+		}
+
+		rf.mu.Lock()
+		if startIdx+len(entries)-1 > rf.lastApplied {
+			rf.lastApplied = startIdx + len(entries) - 1
+		}
+		rf.mu.Unlock()
+	}
+}
+
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
@@ -600,6 +598,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
+	rf.applyCond = sync.NewCond(&rf.mu)
 
 	rf.votedFor = -1
 
@@ -611,6 +611,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 	rf.mu.Unlock()
 	go rf.ticker()
+	go rf.applier()
 
 	return rf
 }
