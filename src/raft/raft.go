@@ -215,8 +215,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictTerm  int
+	ConflictIndex int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -242,13 +244,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.lastHeartbeat = time.Now()
 
+	// Conflict optimization: log is too short
 	if len(rf.log) <= args.PrevLogIdx {
 		reply.Success = false
+		reply.ConflictIndex = len(rf.log)
+		reply.ConflictTerm = -1
 		return
 	}
 
+	// Conflict optimization: log terms mismatch at PrevLogIdx
 	if rf.log[args.PrevLogIdx].Term != args.PrevLogTerm {
 		reply.Success = false
+		reply.ConflictTerm = rf.log[args.PrevLogIdx].Term
+		reply.ConflictIndex = args.PrevLogIdx
+		// Back up to the first index of this conflicting term
+		for i := args.PrevLogIdx; i > 0 && rf.log[i].Term == reply.ConflictTerm; i-- {
+			reply.ConflictIndex = i
+		}
 		return
 	}
 
@@ -372,8 +384,26 @@ func (rf *Raft) startAgreement() {
 					rf.updateLeaderCommitIndex()
 				}
 			} else {
-				// Step back nextIndex on conflict and wait for the next replication run
-				rf.nextIndex[peer]--
+				// Accelerated log backtracking
+				if reply.ConflictTerm == -1 {
+					rf.nextIndex[peer] = reply.ConflictIndex
+				} else {
+					lastIndexForTerm := -1
+					// Search leader's log for the conflicting term
+					for j := len(rf.log) - 1; j > 0; j-- {
+						if rf.log[j].Term == reply.ConflictTerm {
+							lastIndexForTerm = j
+							break
+						}
+					}
+					if lastIndexForTerm > 0 {
+						rf.nextIndex[peer] = lastIndexForTerm + 1
+					} else {
+						rf.nextIndex[peer] = reply.ConflictIndex
+					}
+				}
+
+				// Safety bound to ensure we don't drop below log index 1
 				if rf.nextIndex[peer] < 1 {
 					rf.nextIndex[peer] = 1
 				}
